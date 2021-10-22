@@ -26,6 +26,8 @@ import albumentations as A
 import timm
 from omegaconf import OmegaConf
 import wandb
+import dino.vision_transformer as vits
+import dino.utils as utils
 
 ####################
 # Utils
@@ -40,6 +42,37 @@ def load_pytorch_model(ckpt_name, model, ignore_suffix='model'):
         new_state_dict[name] = v
     model.load_state_dict(new_state_dict, strict=False)
     return model
+
+class LinearClassifier(nn.Module):
+    """Linear layer to train on top of frozen features"""
+    def __init__(self, dim, num_labels=1000):
+        super(LinearClassifier, self).__init__()
+        self.num_labels = num_labels
+        self.linear = nn.Linear(dim, num_labels)
+        self.linear.weight.data.normal_(mean=0.0, std=0.01)
+        self.linear.bias.data.zero_()
+
+    def forward(self, x):
+        # flatten
+        x = x.view(x.size(0), -1)
+
+        # linear layer
+        return self.linear(x)
+
+class ViT(nn.Module):
+    def __init__(self):
+        super(ViT, self).__init__()
+        self.model = vits.__dict__['vit_small'](patch_size=16, num_classes=0)
+        embed_dim = self.model.embed_dim * (4 + int(False))
+        utils.load_pretrained_weights(self.model, '../output_dino/checkpoint.pth', 'teacher', 'vit_small', 16)
+        self.linear_classifier = LinearClassifier(embed_dim, num_labels=1)
+
+    def forward(self, x):
+        with torch.no_grad():
+            intermediate_output = self.model.get_intermediate_layers(x, 4)
+            output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+        output = self.linear_classifier(output)
+        return output
 
 ####################
 # Config
@@ -197,12 +230,13 @@ class LitSystem(pl.LightningModule):
         super().__init__()
         #self.conf = conf
         self.save_hyperparameters(conf)
-        self.model = timm.create_model(model_name=self.hparams.model_name, num_classes=1, pretrained=True, in_chans=3)
-        num_features = self.model.num_features
-        self.model.head = nn.Sequential(nn.Dropout(0.5), nn.Linear(num_features, 1))
-        if self.hparams.model_path is not None:
-            print(f'load model path: {self.hparams.model_path}')
-            self.model = load_pytorch_model(self.hparams.model_path, self.model, ignore_suffix='model')
+        #self.model = timm.create_model(model_name=self.hparams.model_name, num_classes=1, pretrained=True, in_chans=3)
+        #num_features = self.model.num_features
+        #self.model.head = nn.Sequential(nn.Dropout(0.5), nn.Linear(num_features, 1))
+        #if self.hparams.model_path is not None:
+        #    print(f'load model path: {self.hparams.model_path}')
+        #    self.model = load_pytorch_model(self.hparams.model_path, self.model, ignore_suffix='model')
+        self.model = ViT()
         #self.criteria = torch.nn.MSELoss()
         self.criteria = torch.nn.BCEWithLogitsLoss()
 
@@ -212,6 +246,7 @@ class LitSystem(pl.LightningModule):
 
     def configure_optimizers(self):
 
+        #optimizer = torch.optim.AdamW(self.model.linear_classifier.parameters(), lr=self.hparams.lr)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr)
         #optimizer = torch.optim.Adam(self.model.classifier.parameters(), lr=self.hparams.lr)
         #optimizer = torch.optim.Adam([{'params': nn.Sequential(*list(self.model.modules())[:-2]).parameters(), 'lr': self.hparams.lr*0.1},

@@ -16,7 +16,6 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import StratifiedKFold, KFold
@@ -26,6 +25,7 @@ import albumentations as A
 import timm
 from omegaconf import OmegaConf
 import wandb
+import glob
 
 ####################
 # Utils
@@ -46,10 +46,10 @@ def load_pytorch_model(ckpt_name, model, ignore_suffix='model'):
 ####################
 conf_dict = {'batch_size': 8,#32, 
              'epoch': 30,
-             'height': 224,#640,
-             'width': 224,
+             'height': 256,#640,
+             'width': 256,
              'model_name': 'efficientnet_b0',
-             'lr': 1e-5,
+             'lr': 0.001,
              'fold': 0,
              'drop_rate': 0.2,
              'drop_path_rate': 0.2,
@@ -58,7 +58,6 @@ conf_dict = {'batch_size': 8,#32,
              'output_dir': './',
              'pseudo': None,
              'seed': 2021,
-             'group': None,
              'trainer': {}}
 conf_base = OmegaConf.create(conf_dict)
 
@@ -95,7 +94,34 @@ class PawpularDataset(Dataset):
         return {
             "images": torch.tensor(image, dtype=torch.float),
             "features": torch.tensor(features, dtype=torch.float),
-            "targets": torch.tensor([targets], dtype=torch.float)
+            "targets": torch.tensor(targets, dtype=torch.float)
+        }
+
+class PawpularDataset_semisup(Dataset):
+    def __init__(self, img_list, weak_transform=None, strong_transform=None, conf=None):
+        
+        self.img_list = img_list
+        self.weak_transform = weak_transform
+        self.strong_transform = strong_transform
+        self.conf = conf
+       
+    def __len__(self):
+        return len(self.img_list)
+    
+    def __getitem__(self, idx):
+        img_path = self.img_list[idx]
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        image_w = self.weak_transform(image=image)["image"]
+        image_s = self.strong_transform(image=image)["image"]
+            
+        image_w = np.transpose(image_w, (2, 0, 1)).astype(np.float32)
+        image_s = np.transpose(image_s, (2, 0, 1)).astype(np.float32)
+                
+        return {
+            "images_s": torch.tensor(image_s, dtype=torch.float),
+            "images_w": torch.tensor(image_w, dtype=torch.float),
         }
     
 ####################
@@ -119,8 +145,8 @@ class SETIDataModule(pl.LightningDataModule):
             df['dir'] = os.path.join(self.conf.data_dir, "train")
             
             # cv split
-            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.conf.seed)
-            for n, (train_index, val_index) in enumerate(skf.split(df, df["Pawpularity"])):
+            skf = KFold(n_splits=5, shuffle=True, random_state=self.conf.seed)
+            for n, (train_index, val_index) in enumerate(skf.split(df)):
                 df.loc[val_index, 'fold'] = int(n)
             df['fold'] = df['fold'].astype(int)
             
@@ -131,7 +157,10 @@ class SETIDataModule(pl.LightningDataModule):
             #    pseudo_df = pd.read_csv(self.conf.pseudo)
             #    pseudo_df['dir'] = os.path.join(self.conf.data_dir, "test")
             #    train_df = pd.concat([train_df, pseudo_df])
-            '''
+            unlbl_list = []
+            unlbl_list += glob.glob('../ext_data/test_images/*.jpg')
+            unlbl_list += glob.glob('../ext_data/train_images/*.jpg')
+            
             train_transform = A.Compose([
                 A.LongestMaxSize(max_size=self.conf.height),
                 A.PadIfNeeded(min_height=self.conf.height, min_width=self.conf.width, value=0),
@@ -140,15 +169,22 @@ class SETIDataModule(pl.LightningDataModule):
                 A.RandomBrightnessContrast(brightness_limit=(-0.1, 0.1), contrast_limit=(-0.1, 0.1), p=0.5),
                 A.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225],max_pixel_value=255.0,p=1.0,),
                             ],p=1.0)
-            '''
-            train_transform = A.Compose([
-                #A.LongestMaxSize(max_size=self.conf.height),
-                #A.PadIfNeeded(min_height=self.conf.height, min_width=self.conf.width, value=0),
-                A.Resize(height=self.conf.height, width=self.conf.width, p=1),
-                A.Flip(p=0.5),
+
+            valid_transform = A.Compose([
+                A.LongestMaxSize(max_size=self.conf.height),
+                A.PadIfNeeded(min_height=self.conf.height, min_width=self.conf.width, value=0),
+                #A.Resize(height=self.conf.height, width=self.conf.width, p=1),
+                A.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225],max_pixel_value=255.0,p=1.0,),
+                            ],p=1.0)
+
+            strong_transform = A.Compose([
+                A.LongestMaxSize(max_size=self.conf.height),
+                A.PadIfNeeded(min_height=self.conf.height, min_width=self.conf.width, value=0),
+                #A.Resize(height=self.conf.height, width=self.conf.width, p=1),
+                A.HorizontalFlip(p=0.5),
                 A.ShiftScaleRotate(p=0.5),
-                A.HueSaturationValue(hue_shift_limit=0.2, sat_shift_limit=0.2, val_shift_limit=0.2, p=0.5),
-                A.RandomBrightnessContrast(brightness_limit=(-0.1, 0.1), contrast_limit=(-0.1, 0.1), p=0.5),
+                A.HueSaturationValue(hue_shift_limit=0.3, sat_shift_limit=0.3, val_shift_limit=0.3, p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=(-0.2, 0.2), contrast_limit=(-0.2, 0.2), p=0.5),
                 A.OneOf([
                         A.OpticalDistortion(distort_limit=1.0),
                         A.GridDistortion(num_steps=5, distort_limit=1.),
@@ -168,19 +204,16 @@ class SETIDataModule(pl.LightningDataModule):
                 A.Cutout(max_h_size=int(self.conf.height * 0.1), max_w_size=int(self.conf.width * 0.1), num_holes=5, p=0.5),
                 A.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225],max_pixel_value=255.0,p=1.0,),
                             ],p=1.0)
-
-            valid_transform = A.Compose([
-                #A.LongestMaxSize(max_size=self.conf.height),
-                #A.PadIfNeeded(min_height=self.conf.height, min_width=self.conf.width, value=0),
-                A.Resize(height=self.conf.height, width=self.conf.width, p=1),
-                A.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225],max_pixel_value=255.0,p=1.0,),
-                            ],p=1.0)
+            
 
             self.train_dataset = PawpularDataset(train_df, transform=train_transform,conf=self.conf)
             self.valid_dataset = PawpularDataset(valid_df, transform=valid_transform, conf=self.conf)
+            self.unlbl_dataset = PawpularDataset_semisup(unlbl_list, weak_transform=train_transform, strong_transform=strong_transform, conf=self.conf)
             
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.conf.batch_size, num_workers=4, shuffle=True, pin_memory=True, drop_last=True)
+        train_dataloader = DataLoader(self.train_dataset, batch_size=self.conf.batch_size, num_workers=4, shuffle=True, pin_memory=True, drop_last=True)
+        train_dataloader_unlbl = DataLoader(self.unlbl_dataset, batch_size=self.conf.batch_size, num_workers=4, shuffle=True, pin_memory=True, drop_last=True)
+        return [train_dataloader, train_dataloader_unlbl]
 
     def val_dataloader(self):
         return DataLoader(self.valid_dataset, batch_size=self.conf.batch_size, num_workers=4, shuffle=False, pin_memory=True, drop_last=True)
@@ -197,14 +230,13 @@ class LitSystem(pl.LightningModule):
         super().__init__()
         #self.conf = conf
         self.save_hyperparameters(conf)
-        self.model = timm.create_model(model_name=self.hparams.model_name, num_classes=1, pretrained=True, in_chans=3)
-        num_features = self.model.num_features
-        self.model.head = nn.Sequential(nn.Dropout(0.5), nn.Linear(num_features, 1))
+        self.model = timm.create_model(model_name=self.hparams.model_name, num_classes=1, pretrained=True, in_chans=3,
+                                       drop_rate=self.hparams.drop_rate, drop_path_rate=self.hparams.drop_path_rate)
         if self.hparams.model_path is not None:
             print(f'load model path: {self.hparams.model_path}')
             self.model = load_pytorch_model(self.hparams.model_path, self.model, ignore_suffix='model')
-        #self.criteria = torch.nn.MSELoss()
-        self.criteria = torch.nn.BCEWithLogitsLoss()
+        self.criteria = torch.nn.MSELoss()
+        self.consistency_criterion = torch.nn.KLDivLoss(reduction='batchmean')
 
     def forward(self, x):
         # use forward for inference/predictions
@@ -212,41 +244,44 @@ class LitSystem(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr)
-        #optimizer = torch.optim.Adam(self.model.classifier.parameters(), lr=self.hparams.lr)
-        #optimizer = torch.optim.Adam([{'params': nn.Sequential(*list(self.model.modules())[:-2]).parameters(), 'lr': self.hparams.lr*0.1},
-        #                              {'params': self.model.classifier.parameters(), 'lr': self.hparams.lr}], lr=self.hparams.lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr)
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=self.hparams.epoch, eta_min=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams.epoch)
         
         return [optimizer], [scheduler]
 
     def training_step(self, batch, batch_idx):
-        x, f, y = batch['images'], batch['features'], batch['targets']
-        y = y/100.0
-
-        if torch.rand(1)[0] < 0.5: #self.current_epoch < self.hparams.epoch*1.8:
+        x, f, y = batch[0]['images'], batch[0]['features'], batch[0]['targets']
+        x_s, x_w = batch[1]['images_s'], batch[1]['images_w']
+        
+        if self.current_epoch < self.hparams.epoch*0.8:
             # mixup
-            alpha = 0.5
+            alpha = 1.0
             lam = np.random.beta(alpha, alpha)
             batch_size = x.size()[0]
             index = torch.randperm(batch_size)
             x = lam * x + (1 - lam) * x[index, :]
-            #y = lam * y +  (1 - lam) * y[index]
+            y = lam * y +  (1 - lam) * y[index]
+        
+        y_hat = self.model(x)
+        loss = self.criteria(y_hat, y.view(-1, 1))
 
-            y_hat = self.model(x)
-            loss = lam * self.criteria(y_hat, y) + (1 - lam) * self.criteria(y_hat, y[index])
-        else:
-            y_hat = self.model(x)
-            #loss = self.criteria(y_hat, y.view(-1, 1))
-            loss = self.criteria(y_hat, y)
+        if self.current_epoch > 5:
+            with torch.no_grad():
+                self.model.eval()
+                feature_u_w = self.model.forward_features(x_w)
+            self.model.train()
+
+            feature_u_s = self.model.forward_features(x_s)
+            unsup_loss = self.consistency_criterion(feature_u_s, feature_u_w)
+            loss = loss + unsup_loss
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, f, y = batch['images'], batch['features'], batch['targets']
+
         y_hat = self.model(x)
-        #loss = self.criteria(y_hat, y.view(-1, 1))
-        loss = self.criteria(y_hat, y/100.0)
+        loss = self.criteria(y_hat, y.view(-1, 1))
         
         return {
             "val_loss": loss,
@@ -257,7 +292,7 @@ class LitSystem(pl.LightningModule):
     def validation_epoch_end(self, outputs):
         avg_val_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
         y = torch.cat([x["y"] for x in outputs]).cpu().detach().numpy()
-        y_hat = torch.cat([x["y_hat"].sigmoid()*100 for x in outputs]).cpu().detach().numpy()
+        y_hat = torch.cat([x["y_hat"] for x in outputs]).cpu().detach().numpy()
 
         val_score = metrics.mean_squared_error(y, y_hat, squared=False)
 
@@ -274,13 +309,13 @@ def main():
     print(OmegaConf.to_yaml(conf))
     seed_everything(conf.seed)
 
-    tb_logger = loggers.TensorBoardLogger(save_dir=os.path.join(conf.output_dir, conf.group, 'fold' + str(conf.fold), 'tb_log/'))
-    csv_logger = loggers.CSVLogger(save_dir=os.path.join(conf.output_dir, conf.group, 'fold' + str(conf.fold), 'csv_log/'))
-    wandb_logger = loggers.WandbLogger(project='PetFinder2021', log_model=False, group=conf.group)
+    tb_logger = loggers.TensorBoardLogger(save_dir=os.path.join(conf.output_dir, 'tb_log/'))
+    csv_logger = loggers.CSVLogger(save_dir=os.path.join(conf.output_dir, 'csv_log/'))
+    wandb_logger = loggers.WandbLogger(project='PetFinder2021', log_model=False, save_code=True)
 
     lr_monitor = LearningRateMonitor(logging_interval='step')
-    checkpoint_callback = ModelCheckpoint(dirpath=os.path.join(conf.output_dir, conf.group, 'fold' + str(conf.fold), 'ckpt/'), monitor='val_score', 
-                                          save_last=True, save_top_k=1, mode='min', 
+    checkpoint_callback = ModelCheckpoint(dirpath=os.path.join(conf.output_dir, 'ckpt/'), monitor='val_score', 
+                                          save_last=True, save_top_k=5, mode='max', 
                                           save_weights_only=True, filename=f'fold{conf.fold}-'+'{epoch}-{val_score:.5f}')
 
     data_module = SETIDataModule(conf)
@@ -297,6 +332,7 @@ def main():
         precision=16,
         num_sanity_val_steps=10,
         val_check_interval=1.0,
+        multiple_trainloader_mode='min_size',
         **conf.trainer
             )
 
